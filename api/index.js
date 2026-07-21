@@ -1,54 +1,43 @@
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Connection String PostgreSQL Supabase & mot de passe admin
-// NOTE: Use port 6543 (pooler) for serverless environments like Vercel
-const DATABASE_URL = process.env.DATABASE_URL;
+// Clés Supabase (à configurer dans Vercel Environment Variables)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Sinistre2026";
 
-if (!DATABASE_URL) {
-  console.error("CRITICAL: DATABASE_URL environment variable is not set!");
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.error("CRITICAL: SUPABASE_URL ou SUPABASE_SECRET_KEY non configuré !");
 }
 
-// Initialisation du pool de connexions PostgreSQL
-let pool = null;
-if (DATABASE_URL) {
-  try {
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 3,                    // Keep low for serverless
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 10000
-    });
-    pool.on('error', (err) => {
-      console.error('PostgreSQL pool error:', err.message);
-    });
-  } catch (err) {
-    console.error("Erreur d'initialisation du Pool PostgreSQL:", err);
-  }
+// Initialisation du client Supabase (service role = accès complet)
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+    auth: { persistSession: false }
+  });
 }
 
 // Routeur principal
 const router = express.Router();
 
-// GET /status (ou /api/status)
+// ─── GET /status ──────────────────────────────────────────────────────────────
 router.get('/status', async (req, res) => {
-  if (!pool) {
-    return res.json({ status: 'online', dbConnected: false, message: 'DATABASE_URL non configurée' });
+  if (!supabase) {
+    return res.json({ status: 'online', dbConnected: false, message: 'SUPABASE_URL / SUPABASE_SECRET_KEY non configurées' });
   }
   try {
-    const client = await pool.connect();
-    client.release();
+    const { error } = await supabase.from('agents').select('name').limit(1);
+    if (error) throw error;
     return res.json({
       status: 'online',
       dbConnected: true,
-      driver: 'PostgreSQL (pg Pool)',
+      driver: 'Supabase JS Client',
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -61,7 +50,7 @@ router.get('/status', async (req, res) => {
   }
 });
 
-// Auth Admin
+// ─── Auth Admin ───────────────────────────────────────────────────────────────
 router.post('/auth/admin', (req, res) => {
   const { password } = req.body;
   if (password === ADMIN_PASSWORD) {
@@ -70,29 +59,41 @@ router.post('/auth/admin', (req, res) => {
   return res.status(401).json({ success: false, message: "Mot de passe incorrect" });
 });
 
-// Auth Conseiller
+// ─── Auth Conseiller ──────────────────────────────────────────────────────────
 router.post('/auth/agent', async (req, res) => {
   const { name, password } = req.body;
   if (!name || !password) return res.status(400).json({ success: false, message: "Identifiants manquants" });
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée" });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée" });
 
   try {
-    const result = await pool.query('SELECT * FROM public.agents WHERE name = $1 AND password = $2', [name, password]);
-    if (result.rows.length > 0) {
-      return res.json({ success: true, name: result.rows[0].name });
+    const { data, error } = await supabase
+      .from('agents')
+      .select('name')
+      .eq('name', name)
+      .eq('password', password)
+      .single();
+
+    if (error || !data) {
+      return res.status(401).json({ success: false, message: "Mot de passe incorrect" });
     }
-    return res.status(401).json({ success: false, message: "Mot de passe incorrect" });
+    return res.json({ success: true, name: data.name });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /entries - Récupération des codifications
+// ─── GET /entries ─────────────────────────────────────────────────────────────
 router.get('/entries', async (req, res) => {
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée. Vérifiez DATABASE_URL sur Vercel." });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée. Vérifiez SUPABASE_URL et SUPABASE_SECRET_KEY sur Vercel." });
   try {
-    const result = await pool.query('SELECT * FROM public.entries ORDER BY ts DESC');
-    const formatted = result.rows.map(e => ({
+    const { data, error } = await supabase
+      .from('entries')
+      .select('*')
+      .order('ts', { ascending: false });
+
+    if (error) throw error;
+
+    const formatted = (data || []).map(e => ({
       id: e.id,
       ref: e.ref || "",
       motifId: e.motif_id,
@@ -101,7 +102,7 @@ router.get('/entries', async (req, res) => {
       agent: e.agent,
       date: e.date,
       time: e.time,
-      ts: e.ts ? (e.ts instanceof Date ? e.ts.toISOString() : new Date(e.ts).toISOString()) : new Date().toISOString()
+      ts: e.ts ? new Date(e.ts).toISOString() : new Date().toISOString()
     }));
     return res.json(formatted);
   } catch (err) {
@@ -110,72 +111,78 @@ router.get('/entries', async (req, res) => {
   }
 });
 
-// POST /entries - Enregistrement d'un nouvel appel
+// ─── POST /entries ────────────────────────────────────────────────────────────
 router.post('/entries', async (req, res) => {
   const entry = req.body;
   if (!entry || !entry.motifId || !entry.agent) {
     return res.status(400).json({ error: "Champs requis manquants (motifId, agent)" });
   }
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée" });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée" });
 
   const id = entry.id || Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-  const ref = entry.ref || "";
-  const motifId = entry.motifId;
-  const callerType = entry.callerType || null;
-  const comment = entry.comment || null;
-  const agent = entry.agent;
-  const date = entry.date;
-  const time = entry.time;
-  const ts = entry.ts || new Date().toISOString();
+  const row = {
+    id,
+    ref: entry.ref || "",
+    motif_id: entry.motifId,
+    caller_type: entry.callerType || null,
+    comment: entry.comment || null,
+    agent: entry.agent,
+    date: entry.date,
+    time: entry.time,
+    ts: entry.ts || new Date().toISOString()
+  };
 
   try {
-    const query = `
-      INSERT INTO public.entries (id, ref, motif_id, caller_type, comment, agent, date, time, ts)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      ON CONFLICT (id) DO UPDATE SET
-        ref = EXCLUDED.ref,
-        motif_id = EXCLUDED.motif_id,
-        caller_type = EXCLUDED.caller_type,
-        comment = EXCLUDED.comment,
-        agent = EXCLUDED.agent,
-        date = EXCLUDED.date,
-        time = EXCLUDED.time,
-        ts = EXCLUDED.ts
-    `;
-    await pool.query(query, [id, ref, motifId, callerType, comment, agent, date, time, ts]);
-    return res.json({ success: true, entry: { id, ref, motifId, callerType, comment, agent, date, time, ts } });
+    const { error } = await supabase.from('entries').upsert(row, { onConflict: 'id' });
+    if (error) throw error;
+    return res.json({ success: true, entry: { id, ref: row.ref, motifId: row.motif_id, callerType: row.caller_type, comment: row.comment, agent: row.agent, date: row.date, time: row.time, ts: row.ts } });
   } catch (err) {
     console.error("Erreur POST /entries:", err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /agents - Liste des conseillers
+// ─── GET /agents ──────────────────────────────────────────────────────────────
 router.get('/agents', async (req, res) => {
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée. Vérifiez DATABASE_URL sur Vercel." });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée. Vérifiez SUPABASE_URL et SUPABASE_SECRET_KEY sur Vercel." });
   try {
-    const result = await pool.query('SELECT name, password FROM public.agents ORDER BY name ASC');
-    return res.json(result.rows);
+    const { data, error } = await supabase
+      .from('agents')
+      .select('name, password')
+      .order('name');
+
+    if (error) throw error;
+    return res.json(data || []);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /agents - Gestion des comptes
+// ─── POST /agents ─────────────────────────────────────────────────────────────
 router.post('/agents', async (req, res) => {
   const { agents } = req.body;
   if (!Array.isArray(agents)) return res.status(400).json({ error: "Tableau 'agents' requis" });
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée" });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée" });
 
   try {
     const names = agents.map(a => a.name);
+
     if (names.length > 0) {
-      await pool.query('DELETE FROM public.agents WHERE NOT (name = ANY($1::text[]))', [names]);
-      for (const a of agents) {
-        await pool.query('INSERT INTO public.agents (name, password) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET password = EXCLUDED.password', [a.name, a.password]);
-      }
+      // Supprimer ceux qui ne sont plus dans la liste
+      const { error: delError } = await supabase
+        .from('agents')
+        .delete()
+        .not('name', 'in', `(${names.map(n => `"${n}"`).join(',')})`);
+      if (delError) throw delError;
+
+      // Upsert tous les agents
+      const { error: upsertError } = await supabase
+        .from('agents')
+        .upsert(agents.map(a => ({ name: a.name, password: a.password })), { onConflict: 'name' });
+      if (upsertError) throw upsertError;
     } else {
-      await pool.query('DELETE FROM public.agents');
+      const { error } = await supabase.from('agents').delete().neq('name', '');
+      if (error) throw error;
     }
     return res.json({ success: true });
   } catch (err) {
@@ -183,13 +190,15 @@ router.post('/agents', async (req, res) => {
   }
 });
 
-// GET /notes - Récupérer les notes internes
+// ─── GET /notes ───────────────────────────────────────────────────────────────
 router.get('/notes', async (req, res) => {
-  if (!pool) return res.json({ refs: {}, agents: {} });
+  if (!supabase) return res.json({ refs: {}, agents: {} });
   try {
-    const result = await pool.query('SELECT id, data FROM public.notes');
+    const { data, error } = await supabase.from('notes').select('id, data');
+    if (error) throw error;
+
     const notes = { refs: {}, agents: {} };
-    result.rows.forEach(row => {
+    (data || []).forEach(row => {
       if (row.id === 'refs') notes.refs = row.data || {};
       if (row.id === 'agents') notes.agents = row.data || {};
     });
@@ -199,45 +208,50 @@ router.get('/notes', async (req, res) => {
   }
 });
 
-// POST /notes - Sauvegarder les notes internes
+// ─── POST /notes ──────────────────────────────────────────────────────────────
 router.post('/notes', async (req, res) => {
   const notes = req.body;
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée" });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée" });
 
   try {
-    const refsData = JSON.stringify(notes.refs || {});
-    const agentsData = JSON.stringify(notes.agents || {});
-
-    await pool.query('INSERT INTO public.notes (id, data) VALUES ($1, $2::jsonb) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data', ['refs', refsData]);
-    await pool.query('INSERT INTO public.notes (id, data) VALUES ($1, $2::jsonb) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data', ['agents', agentsData]);
-
+    const { error } = await supabase.from('notes').upsert([
+      { id: 'refs', data: notes.refs || {} },
+      { id: 'agents', data: notes.agents || {} }
+    ], { onConflict: 'id' });
+    if (error) throw error;
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// GET /settings - Récupérer les paramètres
+// ─── GET /settings ────────────────────────────────────────────────────────────
 router.get('/settings', async (req, res) => {
-  if (!pool) return res.json({ threshold: 3 });
+  if (!supabase) return res.json({ threshold: 3 });
   try {
-    const result = await pool.query("SELECT value FROM public.settings WHERE key = 'threshold'");
-    if (result.rows.length > 0) {
-      return res.json({ threshold: parseInt(result.rows[0].value) || 3 });
-    }
-    return res.json({ threshold: 3 });
+    const { data, error } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', 'threshold')
+      .single();
+
+    if (error || !data) return res.json({ threshold: 3 });
+    return res.json({ threshold: parseInt(data.value) || 3 });
   } catch (err) {
     return res.json({ threshold: 3 });
   }
 });
 
-// POST /settings - Enregistrer le seuil d'alerte
+// ─── POST /settings ───────────────────────────────────────────────────────────
 router.post('/settings', async (req, res) => {
   const { threshold } = req.body;
-  if (!pool) return res.status(500).json({ error: "Base de données non connectée" });
+  if (!supabase) return res.status(500).json({ error: "Base de données non connectée" });
 
   try {
-    await pool.query("INSERT INTO public.settings (key, value) VALUES ('threshold', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(threshold)]);
+    const { error } = await supabase
+      .from('settings')
+      .upsert({ key: 'threshold', value: String(threshold) }, { onConflict: 'key' });
+    if (error) throw error;
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -252,5 +266,5 @@ module.exports = app;
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`Serveur Express (PostgreSQL Pool) démarré sur http://localhost:${PORT}`));
+  app.listen(PORT, () => console.log(`Serveur Express (Supabase JS) démarré sur http://localhost:${PORT}`));
 }
